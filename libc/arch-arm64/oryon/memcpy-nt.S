@@ -58,7 +58,7 @@
 
 ALIAS_SYMBOL (__memmove_aarch64_nt, __memcpy_aarch64_nt)
 ENTRY (__memcpy_aarch64_nt)
-
+    cbz    count, L(copy0)
     add    srcend, src, count
     add    dstend, dstin, count
     cmp    count, 128
@@ -96,7 +96,6 @@ L(copy8):
 
     /* Copy 0..3 bytes using a branchless sequence.  */
 L(copy4):
-    cbz    count, L(copy0)
     lsr    tmp1, count, 1
     ldrb    A_lw, [src]
     ldrb    C_lw, [srcend, -1]
