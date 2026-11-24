@@ -26,15 +26,28 @@
  * SUCH DAMAGE.
  */
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "private/bionic_fdtrack.h"
 #include "private/bionic_fortify.h"
+#include "custom_rom_hide.h"
 
 extern "C" int __openat(int, const char*, int, int);
+
+static inline const char* redirect_proc_cpuinfo(const char* pathname) {
+  if (pathname != nullptr && __predict_false(pathname[0] == '/' && strcmp(pathname, "/proc/cpuinfo") == 0)) {
+    const char* spoofed = getenv("SPOOF_CPUINFO_PATH");
+    if (spoofed != nullptr && spoofed[0] != '\0') {
+      return spoofed;
+    }
+  }
+  return pathname;
+}
 
 static inline int force_O_LARGEFILE(int flags) {
 #if defined(__LP64__)
@@ -48,12 +61,39 @@ static inline bool needs_mode(int flags) {
   return ((flags & O_CREAT) == O_CREAT) || ((flags & O_TMPFILE) == O_TMPFILE);
 }
 
+static inline bool can_filter_open(int flags) {
+  return (flags & O_ACCMODE) == O_RDONLY &&
+         (flags & (O_CREAT | O_TRUNC | O_TMPFILE | O_PATH | O_DIRECTORY)) == 0;
+}
+
+static int filter_readonly_file(const char* path, int flags) {
+  if (!path || path[0] != '/' || !can_filter_open(flags)) return -1;
+  int fd = custom_rom_hide_filter_proc(path);
+  if (fd < 0) fd = custom_rom_hide_filter_vintf(path);
+  if (fd < 0) fd = custom_rom_hide_filter_sepolicy(path);
+  // O_NOFOLLOW only concerns the last component: regular files such as /proc/cmdline are
+  // substituted as usual, while a symlink such as /proc/mounts must still fail with ELOOP.
+  if (fd >= 0 && (flags & O_NOFOLLOW) && custom_rom_hide_is_symlink(path)) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static inline int finish_filtered(int filtered_fd, int flags) {
+  if (filtered_fd >= 0 && (flags & O_CLOEXEC)) {
+    fcntl(filtered_fd, F_SETFD, FD_CLOEXEC);
+  }
+  return filtered_fd;
+}
+
 int creat(const char* pathname, mode_t mode) {
   return open(pathname, O_CREAT | O_TRUNC | O_WRONLY, mode);
 }
 __strong_alias(creat64, creat);
 
 int open(const char* pathname, int flags, ...) {
+  pathname = redirect_proc_cpuinfo(pathname);
   mode_t mode = 0;
 
   if (needs_mode(flags)) {
@@ -61,6 +101,14 @@ int open(const char* pathname, int flags, ...) {
     va_start(args, flags);
     mode = static_cast<mode_t>(va_arg(args, int));
     va_end(args);
+  }
+
+  int filtered_fd = filter_readonly_file(pathname, flags);
+  if (filtered_fd >= 0) return FDTRACK_CREATE(finish_filtered(filtered_fd, flags));
+
+  if (custom_rom_hide_should_block(pathname)) {
+    errno = ENOENT;
+    return -1;
   }
 
   return FDTRACK_CREATE(__openat(AT_FDCWD, pathname, force_O_LARGEFILE(flags), mode));
@@ -68,11 +116,19 @@ int open(const char* pathname, int flags, ...) {
 __strong_alias(open64, open);
 
 int __open_2(const char* pathname, int flags) {
+  pathname = redirect_proc_cpuinfo(pathname);
   if (needs_mode(flags)) __fortify_fatal("open: called with O_CREAT/O_TMPFILE but no mode");
+  int filtered_fd = filter_readonly_file(pathname, flags);
+  if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("open", finish_filtered(filtered_fd, flags));
+  if (custom_rom_hide_should_block(pathname)) {
+    errno = ENOENT;
+    return -1;
+  }
   return FDTRACK_CREATE_NAME("open", __openat(AT_FDCWD, pathname, force_O_LARGEFILE(flags), 0));
 }
 
 int openat(int fd, const char *pathname, int flags, ...) {
+  pathname = redirect_proc_cpuinfo(pathname);
   mode_t mode = 0;
 
   if (needs_mode(flags)) {
@@ -82,11 +138,30 @@ int openat(int fd, const char *pathname, int flags, ...) {
     va_end(args);
   }
 
+  if (fd == AT_FDCWD) {
+    int filtered_fd = filter_readonly_file(pathname, flags);
+    if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("openat", finish_filtered(filtered_fd, flags));
+  }
+
+  if (custom_rom_hide_should_block_at(fd, pathname)) {
+    errno = ENOENT;
+    return -1;
+  }
+
   return FDTRACK_CREATE_NAME("openat", __openat(fd, pathname, force_O_LARGEFILE(flags), mode));
 }
 __strong_alias(openat64, openat);
 
 int __openat_2(int fd, const char* pathname, int flags) {
+  pathname = redirect_proc_cpuinfo(pathname);
   if (needs_mode(flags)) __fortify_fatal("open: called with O_CREAT/O_TMPFILE but no mode");
+  if (fd == AT_FDCWD) {
+    int filtered_fd = filter_readonly_file(pathname, flags);
+    if (filtered_fd >= 0) return FDTRACK_CREATE_NAME("openat", finish_filtered(filtered_fd, flags));
+  }
+  if (custom_rom_hide_should_block_at(fd, pathname)) {
+    errno = ENOENT;
+    return -1;
+  }
   return FDTRACK_CREATE_NAME("openat", __openat(fd, pathname, force_O_LARGEFILE(flags), 0));
 }
